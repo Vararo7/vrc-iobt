@@ -1,0 +1,370 @@
+name: Build Quest 3 Body API State Probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+      - name: Install Android build requirements
+        shell: bash
+        run: |
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.3.13750724" "cmake;3.22.1"
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Generate project source
+        shell: bash
+        run: |
+          mkdir -p 'app'
+          cat > 'app/build.gradle' <<'__BODYAPI_STATE_0__'
+          plugins { id 'com.android.application' }
+          android {
+            namespace 'dev.quest.iobt.bodyapistateprobe'
+            compileSdk 35
+            ndkVersion '27.3.13750724'
+            defaultConfig {
+              applicationId 'dev.quest.iobt.bodyapistateprobe'
+              minSdk 29
+              targetSdk 34
+              versionCode 1
+              versionName '1.0'
+              ndk { abiFilters 'arm64-v8a' }
+            }
+            externalNativeBuild { cmake { path file('src/main/cpp/CMakeLists.txt'); version '3.22.1' } }
+          }
+          __BODYAPI_STATE_0__
+          mkdir -p 'app/src/main'
+          cat > 'app/src/main/AndroidManifest.xml' <<'__BODYAPI_STATE_1__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="Quest Body API State Probe" android:allowBackup="false"
+                android:theme="@android:style/Theme.Material.Light.NoActionBar">
+              <uses-native-library android:name="libripcclient.oculus.so" android:required="false" />
+              <uses-native-library android:name="libripcmanager.oculus.so" android:required="false" />
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+              <receiver android:name=".ProbeReceiver" android:exported="true" android:process=":ripc_probe" />
+            </application>
+          </manifest>
+          __BODYAPI_STATE_1__
+          mkdir -p 'app/src/main/cpp'
+          cat > 'app/src/main/cpp/CMakeLists.txt' <<'__BODYAPI_STATE_2__'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(quest_ripc_connect_probe LANGUAGES CXX)
+          add_library(ripcconnectprobe SHARED ripc_connect_probe.cpp)
+          target_compile_features(ripcconnectprobe PRIVATE cxx_std_17)
+          target_link_libraries(ripcconnectprobe dl log)
+          __BODYAPI_STATE_2__
+          mkdir -p 'app/src/main/cpp'
+          cat > 'app/src/main/cpp/ripc_connect_probe.cpp' <<'__BODYAPI_STATE_3__'
+          #include <jni.h>
+          #include <dlfcn.h>
+          #include <android/log.h>
+          #include <cstdint>
+          #include <algorithm>
+          #include <chrono>
+          #include <sstream>
+          #include <string>
+          #include <thread>
+          #include <vector>
+          #include <array>
+          
+          namespace {
+          constexpr const char* kTag = "QuestBodyState";
+          
+          // The arguments to ipc_Initialize were reconstructed from the Quest system
+          // library and previously worked on this Quest firmware. This is NOT a public
+          // Meta SDK ABI; this experiment may cease to work after an OS update.
+          struct alignas(8) ExperimentalPlatformContext {
+              std::uint64_t reserved[4]{};
+          };
+          static_assert(sizeof(ExperimentalPlatformContext) == 32);
+          
+          using RuntimeVersionFn = std::uint32_t (*)();
+          using IsInitializedFn = bool (*)();
+          using InitializeFn = std::uint32_t (*)(const void*);
+          using ConnectFn = std::uint32_t (*)(const char*, const char*, const char*);
+          // Verified against ARM64 disassembly of Quest Runtime IPC v90:
+          // x0 = 32-bit client handle, x1 = nul-terminated state name.
+          // Returns a 32-bit state-memory ID (zero is invalid).
+          using GetStateFn = std::uint32_t (*)(std::uint32_t, const char*);
+          using GetMaxSizeFn = std::uint64_t (*)(std::uint32_t);
+          // Optional experimental read-only sampling API. The pair must be balanced.
+          // GetServerStateBegin(handle, u32*, u32*) returns a pointer to mapped state.
+          // GetServerStateEnd(handle, u32, bool*) releases the read transaction.
+          using StateBeginFn = const void* (*)(std::uint32_t, std::uint32_t*, std::uint32_t*);
+          using StateEndFn = bool (*)(std::uint32_t, std::uint32_t, bool*);
+          
+          const std::array<const char*, 8> kStates = {
+              "bodyPose_", "bodySkeleton_", "bodyPoseFullBody_", "bodySkeletonFullBody_",
+              "bodyState_", "bodyStateExtra_", "serviceInfo_", "bodyCodec_"
+          };
+          
+          std::string dlError() { const char* e=dlerror(); return e ? e : "unknown"; }
+          template<typename Fn>
+          Fn symbol(void* lib, const char* name, std::ostringstream& out) {
+              dlerror(); void* p=dlsym(lib,name); const char* err=dlerror();
+              out << "SYMBOL " << name << "=" << ((!err && p) ? "FOUND" : "MISSING") << "\n";
+              return (!err && p) ? reinterpret_cast<Fn>(p) : nullptr;
+          }
+          
+          // Do not log raw skeleton or pose bytes; only calculate a fingerprint for the
+          // bounded first 64 bytes to see whether a state buffer changes between samples.
+          std::uint64_t fingerprint(const void* ptr, std::size_t count) {
+              const auto* b = static_cast<const std::uint8_t*>(ptr);
+              std::uint64_t h=14695981039346656037ULL;
+              for (std::size_t i=0;i<count;i++){h^=b[i]; h*=1099511628211ULL;}
+              return h;
+          }
+          
+          struct ProbeState {const char* name; std::uint32_t handle=0; std::uint64_t size=0;};
+          }
+          
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_dev_quest_iobt_bodyapistateprobe_ProbeRunner_nativeRun(
+              JNIEnv* env, jclass, jstring stageStr) {
+          
+              const char* chars=env->GetStringUTFChars(stageStr,nullptr);
+              const std::string stage=chars ? chars : "inspect";
+              if (chars) env->ReleaseStringUTFChars(stageStr,chars);
+              const bool inspect=(stage=="inspect");
+              const bool doSample=(stage=="sample");
+              std::ostringstream out;
+              out << "PROBE_VERSION=1\n";
+              out << "STAGE=" << stage << "\n";
+              out << "TARGET=com.oculus.bodyapiservice:com.oculus.bodyapiservice (BodyApiServiceServer)\n";
+              out << "RAW_COORDINATES=NEVER_LOGGED\n";
+          
+              void* lib=dlopen("libripcclient.oculus.so",RTLD_NOW|RTLD_LOCAL);
+              if (!lib) {
+                  out << "LIBRARY_OPEN=FAIL ERROR=" << dlError() << "\n";
+                  return env->NewStringUTF(out.str().c_str());
+              }
+              out << "LIBRARY_OPEN=OK\n";
+              auto version=symbol<RuntimeVersionFn>(lib,"ipc_GetRuntimeVersion",out);
+              auto initialized=symbol<IsInitializedFn>(lib,"ipc_IsInitialized",out);
+              auto initialize=symbol<InitializeFn>(lib,"ipc_Initialize",out);
+              auto connect=symbol<ConnectFn>(lib,"ipc_ConnectToServer",out);
+              auto getState=symbol<GetStateFn>(lib,"ipc_GetServerState",out);
+              auto getMax=symbol<GetMaxSizeFn>(lib,"ipc_GetServerStateMaxSize",out);
+              auto begin=symbol<StateBeginFn>(lib,"ipc_GetServerStateBegin",out);
+              auto end=symbol<StateEndFn>(lib,"ipc_GetServerStateEnd",out);
+              if(version) out << "RUNTIME_VERSION=" << version() << "\n";
+          
+              // Guard against running the private ABI against a different runtime build.
+              if (!version || version()!=90) {
+                  out << "ABORT=UNSUPPORTED_RUNTIME_VERSION_EXPECTED_90\n";
+                  dlclose(lib);
+                  return env->NewStringUTF(out.str().c_str());
+              }
+              if(inspect) {
+                  out << "STATE_LOOKUP=NOT_ATTEMPTED\n";
+                  dlclose(lib);
+                  return env->NewStringUTF(out.str().c_str());
+              }
+              if(!initialized || !initialize || !connect || !getState || !getMax) {
+                  out << "ABORT=REQUIRED_SYMBOL_MISSING\n";
+                  dlclose(lib);
+                  return env->NewStringUTF(out.str().c_str());
+              }
+              if(doSample && (!begin || !end)){
+                  out << "ABORT=SAMPLING_SYMBOL_MISSING\n";
+                  dlclose(lib);
+                  return env->NewStringUTF(out.str().c_str());
+              }
+          
+              if (!initialized()) {
+                  __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=BEFORE_INITIALIZE");
+                  ExperimentalPlatformContext ctx;
+                  auto rc=initialize(&ctx);
+                  __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=AFTER_INITIALIZE raw=%u",rc);
+                  out << "INITIALIZE_RAW=" << rc << "\n";
+              }
+              if (!initialized()) {
+                  out << "ABORT=INITIALIZATION_FAILED\n";
+                  dlclose(lib);
+                  return env->NewStringUTF(out.str().c_str());
+              }
+              __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=BEFORE_CONNECT");
+              const std::uint32_t client=connect("com.oculus.bodyapiservice", "com.oculus.bodyapiservice", "BodyApiServiceServer");
+              __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=AFTER_CONNECT client=%u",client);
+              out << "CONNECT_CLIENT_HANDLE=" << client << "\n";
+              if (client==0) {
+                  out << "ABORT=CONNECT_RETURNED_INVALID_CLIENT_HANDLE\n";
+                  dlclose(lib);
+                  return env->NewStringUTF(out.str().c_str());
+              }
+              out << "CONNECTION_CHECK=CONSULT_RUNTIMEIPC_LOGS_FOR_SUCCESS\n";
+              std::array<ProbeState,8> found{};
+              for(std::size_t i=0;i<kStates.size();i++) found[i].name=kStates[i];
+          
+              // Meta's server may publish states asynchronously. Recheck existing keys
+              // after 1.2 sec, without requesting that the producer enable tracking.
+              for(int round=0;round<2;round++) {
+                  if(round) std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+                  out << "LOOKUP_ROUND=" << round << "\n";
+                  for(auto& state:found) {
+                      __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=GET_STATE name=%s",state.name);
+                      const auto handle=getState(client,state.name);
+                      if(handle) {
+                          state.handle=handle;
+                          state.size=getMax(handle);
+                          out << "STATE " << state.name << " PRESENT=YES HANDLE=" << handle
+                              << " MAX_BYTES=" << state.size << "\n";
+                      }else{
+                          out << "STATE " << state.name << " PRESENT=NO\n";
+                      }
+                  }
+              }
+              out << "STATE_METADATA_ONLY=" << (!doSample ? "YES" : "NO") << "\n";
+          
+              if(doSample) {
+                  // Optional advanced stage. Begin/End are private and not documented;
+                  // invoke only for a valid state, and bound reads to 64 bytes.
+                  out << "SAMPLING=EXPERIMENTAL_READ_ONLY\n";
+                  for (auto& state:found) {
+                      const std::string name(state.name);
+                      if (name!="bodyPose_" && name!="bodyPoseFullBody_") continue;
+                      if (!state.handle || !state.size) {
+                          out << "SAMPLE state=" << name << " SKIPPED=UNAVAILABLE\n";
+                          continue;
+                      }
+                      std::uint64_t previous=0;
+                      bool previousSet=false;
+                      for(int i=0;i<4;i++) {
+                          if(i) std::this_thread::sleep_for(std::chrono::milliseconds(400));
+                          std::uint32_t slot=0, counter=0;
+                          __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=BEFORE_SAMPLE index=%d",i);
+                          const void* data=begin(state.handle,&slot,&counter);
+                          if(!data) {
+                              out << "SAMPLE state=" << name << " index=" << i << " BUFFER=UNAVAILABLE\n";
+                              break;
+                          }
+                          std::size_t n=static_cast<std::size_t>(std::min<std::uint64_t>(state.size,64));
+                          auto hash=fingerprint(data,n);
+                          bool retry=false;
+                          const bool endOk=end(state.handle,slot,&retry);
+                          out << "SAMPLE state="<<name<<" index="<<i<<" BUFFER=AVAILABLE COUNTER="<<counter
+                              <<" CHANGED_FROM_PREVIOUS=" << (previousSet ? (hash!=previous ? "YES":"NO") : "N/A")
+                              <<" END_OK="<<(endOk?"YES":"NO")
+                              <<" RETRY="<<(retry?"YES":"NO") <<"\n";
+                          previous=hash; previousSet=true;
+                          __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=AFTER_SAMPLE index=%d",i);
+                          if(!endOk) break;
+                      }
+                  }
+                  out << "FRESHNESS_INTERPRETATION=CONTENT_CHANGE_DOES_NOT_PROVE_ACTIVE_IOBT\n";
+              }
+          
+              out << "TRACKING_ACTIVATION=NOT_REQUESTED\n";
+              out << "RAW_JOINTS=NOT_EXPORTED\n";
+              // Only the dedicated Android process holds this private runtime state.
+              dlclose(lib);
+              return env->NewStringUTF(out.str().c_str());
+          }
+          __BODYAPI_STATE_3__
+          mkdir -p 'app/src/main/java/dev/quest/iobt/bodyapistateprobe'
+          cat > 'app/src/main/java/dev/quest/iobt/bodyapistateprobe/MainActivity.java' <<'__BODYAPI_STATE_4__'
+          package dev.quest.iobt.bodyapistateprobe;
+          
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.widget.TextView;
+          
+          public final class MainActivity extends Activity {
+              @Override public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  TextView tv = new TextView(this);
+                  tv.setTextSize(17f);
+                  tv.setPadding(24,24,24,24);
+                  tv.setText("Quest 3 Body API State Probe\n\nRun the ADB broadcast while VRChat is open.\nNo immersive session or tracker changes.");
+                  setContentView(tv);
+              }
+          }
+          __BODYAPI_STATE_4__
+          mkdir -p 'app/src/main/java/dev/quest/iobt/bodyapistateprobe'
+          cat > 'app/src/main/java/dev/quest/iobt/bodyapistateprobe/ProbeReceiver.java' <<'__BODYAPI_STATE_5__'
+          package dev.quest.iobt.bodyapistateprobe;
+          
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          
+          public final class ProbeReceiver extends BroadcastReceiver {
+              @Override public void onReceive(Context ctx, Intent intent) {
+                  String s = intent.getStringExtra("stage");
+                  if (!"state".equals(s) && !"sample".equals(s)) s = "inspect";
+                  final String stage = s;
+                  final PendingResult pending = goAsync();
+                  new Thread(() -> {
+                      try { ProbeRunner.run(stage); }
+                      finally { pending.finish(); }
+                  }, "quest-body-state-probe").start();
+              }
+          }
+          __BODYAPI_STATE_5__
+          mkdir -p 'app/src/main/java/dev/quest/iobt/bodyapistateprobe'
+          cat > 'app/src/main/java/dev/quest/iobt/bodyapistateprobe/ProbeRunner.java' <<'__BODYAPI_STATE_6__'
+          package dev.quest.iobt.bodyapistateprobe;
+          
+          import android.util.Log;
+          
+          final class ProbeRunner {
+              static final String TAG = "QuestBodyState";
+              static { System.loadLibrary("ripcconnectprobe"); }
+              private static native String nativeRun(String stage);
+          
+              static void run(String stage) {
+                  Log.i(TAG, "RESULT_BEGIN stage=" + stage);
+                  try {
+                      String result = nativeRun(stage);
+                      for (String line : result.split("\n")) Log.i(TAG, line);
+                  } catch (Throwable t) {
+                      Log.e(TAG, "PROBE_ERROR", t);
+                  }
+                  Log.i(TAG, "RESULT_END stage=" + stage);
+              }
+          }
+          __BODYAPI_STATE_6__
+          mkdir -p '.'
+          cat > 'build.gradle' <<'__BODYAPI_STATE_7__'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          __BODYAPI_STATE_7__
+          mkdir -p '.'
+          cat > 'settings.gradle' <<'__BODYAPI_STATE_8__'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'QuestBodyAPIStateProbe'
+          include ':app'
+          __BODYAPI_STATE_8__
+      - name: Build debug APK
+        shell: bash
+        run: gradle --no-daemon :app:assembleDebug
+      - name: Publish APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quest3-BodyAPI-StateProbe-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
