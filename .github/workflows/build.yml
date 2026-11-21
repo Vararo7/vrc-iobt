@@ -1,0 +1,202 @@
+name: Build Quest 3 IOBT lifecycle probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out this workflow
+        uses: actions/checkout@v4
+
+      - name: Check out official Meta Spatial SDK sample
+        uses: actions/checkout@v4
+        with:
+          repository: meta-quest/Meta-Spatial-SDK-Samples
+          path: meta-samples
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Enable Android licenses
+        shell: bash
+        run: yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Add body tracking diagnostics
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          project = Path('meta-samples/BodyTrackingSample')
+          src = project / 'app/src/main/java/com/meta/spatial/samples/bodytrackingsample'
+          activity = src / 'BodyTrackingSampleActivity.kt'
+          manifest = project / 'app/src/main/AndroidManifest.xml'
+          gradle = project / 'app/build.gradle.kts'
+          assert activity.exists() and manifest.exists() and gradle.exists(), 'Meta changed sample layout.'
+
+          def replace_once(s, original, replacement):
+              count = s.count(original)
+              if count != 1:
+                  raise RuntimeError(f'Expected 1 anchor but found {count}: {original[:100]}')
+              return s.replace(original, replacement, 1)
+
+          s = activity.read_text()
+          s = replace_once(s,
+              'import android.os.Bundle',
+              'import android.os.Bundle\nimport android.os.SystemClock\nimport android.content.Intent\nimport android.util.Log')
+          s = replace_once(s,
+              'class BodyTrackingSampleActivity : AppSystemActivity() {',
+              '''class BodyTrackingSampleActivity : AppSystemActivity() {
+              private var probeTicks: Long = 0L
+              private var probeLastReportMs: Long = 0L
+
+              override fun onResume() {
+                  super.onResume()
+                  Log.i("QuestIOBTProbe", "ACTIVITY onResume")
+              }
+
+              override fun onPause() {
+                  Log.w("QuestIOBTProbe", "ACTIVITY onPause ticks=$probeTicks")
+                  super.onPause()
+              }
+
+              override fun onStop() {
+                  Log.w("QuestIOBTProbe", "ACTIVITY onStop ticks=$probeTicks")
+                  super.onStop()
+              }
+              ''')
+          s = replace_once(s,
+              'super.onCreate(savedInstanceState)',
+              '''super.onCreate(savedInstanceState)
+              Log.i("QuestIOBTProbe", "ACTIVITY onCreate")
+              try {
+                  startForegroundService(Intent(this, ProbeService::class.java))
+              } catch (e: Exception) {
+                  Log.e("QuestIOBTProbe", "Service start failed", e)
+              }
+              ''')
+          s = replace_once(s,
+              'if (scene.updateBodyTrackingBuffersAtTime(jointPoses, skeletonPoses)) {',
+              '''val gotBody = scene.updateBodyTrackingBuffersAtTime(jointPoses, skeletonPoses)
+              probeTicks++
+              val nowMs = SystemClock.elapsedRealtime()
+              ProbeService.lastTickMs = nowMs
+              val validJoints = if (gotBody) jointPoses.count { (it.flags and JointPose.ValidBits) != 0 } else 0
+              if (validJoints > 0) {
+                  ProbeService.lastValidMs = nowMs
+                  ProbeService.lastValidCount = validJoints
+              }
+              if (nowMs - probeLastReportMs >= 1000L) {
+                  probeLastReportMs = nowMs
+                  Log.i("QuestIOBTProbe", "FRAME gotBody=$gotBody validJoints=$validJoints totalJoints=${jointPoses.size} ticks=$probeTicks")
+              }
+              if (gotBody) {''')
+          s = replace_once(s,
+              'scene.releaseBodyTrackingBuffers()',
+              '''Log.w("QuestIOBTProbe", "ACTIVITY onDestroy")
+              scene.releaseBodyTrackingBuffers()''')
+          activity.write_text(s)
+
+          (src/'ProbeService.kt').write_text('''package com.meta.spatial.samples.bodytrackingsample
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.util.Log
+
+          // Process heartbeat only. It intentionally does NOT access camera or body poses.
+          // Pose polling happens in the immersive sample activity.
+          class ProbeService : Service() {
+              companion object {
+                  @Volatile var lastTickMs: Long = 0L
+                  @Volatile var lastValidMs: Long = 0L
+                  @Volatile var lastValidCount: Int = 0
+              }
+              private val handler = Handler(Looper.getMainLooper())
+              private val heartbeat = object : Runnable {
+                  override fun run() {
+                      val now = SystemClock.elapsedRealtime()
+                      val tickAge = if (lastTickMs == 0L) -1 else now-lastTickMs
+                      val validAge = if (lastValidMs == 0L) -1 else now-lastValidMs
+                      Log.i("QuestIOBTProbe", "SERVICE heartbeat tickAgeMs=$tickAge validPoseAgeMs=$validAge lastValidJoints=$lastValidCount")
+                      handler.postDelayed(this, 2000L)
+                  }
+              }
+              override fun onCreate() {
+                  super.onCreate()
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("probe_status", "IOBT probe", NotificationManager.IMPORTANCE_LOW))
+                  val notification = Notification.Builder(this, "probe_status")
+                      .setSmallIcon(android.R.drawable.stat_notify_sync)
+                      .setContentTitle("IOBT lifecycle test")
+                      .setContentText("Recording XR focus and joint update diagnostics")
+                      .build()
+                  startForeground(1042, notification)
+                  Log.i("QuestIOBTProbe", "SERVICE onCreate")
+                  handler.post(heartbeat)
+              }
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+              override fun onBind(intent: Intent?): IBinder? = null
+              override fun onDestroy() {
+                  handler.removeCallbacks(heartbeat)
+                  Log.w("QuestIOBTProbe", "SERVICE onDestroy")
+                  super.onDestroy()
+              }
+          }
+          ''')
+
+          m = manifest.read_text()
+          m = replace_once(m, '<application ',
+              '''<uses-permission android:name="com.oculus.permission.BODY_TRACKING" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+              <application ''')
+          m = replace_once(m, '</application>',
+              '''    <service android:name=".ProbeService" android:exported="false" android:foregroundServiceType="dataSync" />
+              </application>''')
+          m = m.replace('android:label="bodytrackingsample"', 'android:label="Quest IOBT Probe"')
+          manifest.write_text(m)
+
+          g = gradle.read_text()
+          g = replace_once(g,
+              'applicationId = "com.meta.spatial.samples.bodytrackingsample"',
+              'applicationId = "dev.quest.iobt.probe"')
+          g = replace_once(g,
+              'appPackage.set("com.meta.spatial.samples.bodytrackingsample")',
+              'appPackage.set("dev.quest.iobt.probe")')
+          gradle.write_text(g)
+          print('Patched official Meta Spatial SDK BodyTrackingSample')
+          PY
+
+      - name: Build installable debug APK (signed by Android debug keystore)
+        working-directory: meta-samples/BodyTrackingSample
+        shell: bash
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload Quest APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quest3-IOBT-Lifecycle-Probe-debug-apk
+          path: meta-samples/BodyTrackingSample/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
