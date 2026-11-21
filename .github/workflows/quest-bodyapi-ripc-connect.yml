@@ -1,0 +1,276 @@
+name: Build Quest 3 BodyApiService IPC Connection Probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+      - name: Install Android build requirements
+        shell: bash
+        run: |
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.3.13750724" "cmake;3.22.1"
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Generate project source
+        shell: bash
+        run: |
+          mkdir -p '.'
+          cat > 'settings.gradle' <<'__QUEST_RIPC_FILE_0__'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'QuestBodyApiRIPCProbe'
+          include ':app'
+          __QUEST_RIPC_FILE_0__
+          mkdir -p '.'
+          cat > 'build.gradle' <<'__QUEST_RIPC_FILE_1__'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          __QUEST_RIPC_FILE_1__
+          mkdir -p 'app'
+          cat > 'app/build.gradle' <<'__QUEST_RIPC_FILE_2__'
+          plugins { id 'com.android.application' }
+          android {
+            namespace 'dev.quest.iobt.bodyapiconnectprobe'
+            compileSdk 35
+            ndkVersion '27.3.13750724'
+            defaultConfig {
+              applicationId 'dev.quest.iobt.bodyapiconnectprobe'
+              minSdk 29
+              targetSdk 34
+              versionCode 1
+              versionName '1.0'
+              ndk { abiFilters 'arm64-v8a' }
+            }
+            externalNativeBuild { cmake { path file('src/main/cpp/CMakeLists.txt'); version '3.22.1' } }
+          }
+          __QUEST_RIPC_FILE_2__
+          mkdir -p 'app/src/main'
+          cat > 'app/src/main/AndroidManifest.xml' <<'__QUEST_RIPC_FILE_3__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="Quest Body API IPC Probe" android:allowBackup="false"
+                android:theme="@android:style/Theme.Material.Light.NoActionBar">
+              <uses-native-library android:name="libripcclient.oculus.so" android:required="false" />
+              <uses-native-library android:name="libripcmanager.oculus.so" android:required="false" />
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+              <receiver android:name=".ProbeReceiver" android:exported="true" android:process=":ripc_probe" />
+            </application>
+          </manifest>
+          __QUEST_RIPC_FILE_3__
+          mkdir -p 'app/src/main/java/dev/quest/iobt/bodyapiconnectprobe'
+          cat > 'app/src/main/java/dev/quest/iobt/bodyapiconnectprobe/ProbeRunner.java' <<'__QUEST_RIPC_FILE_4__'
+          package dev.quest.iobt.bodyapiconnectprobe;
+          
+          import android.content.Context;
+          import android.util.Log;
+          
+          final class ProbeRunner {
+            static final String TAG = "QuestBodyRIPC";
+            static { System.loadLibrary("ripcconnectprobe"); }
+            private static native String nativeInspect(boolean connect);
+            static void run(String stage, String source) {
+              boolean connect = "connect".equals(stage);
+              Log.i(TAG, "RESULT_BEGIN source=" + source + " stage=" + (connect ? "CONNECT" : "INSPECT"));
+              try {
+                String result = nativeInspect(connect);
+                for (String line : result.split("\n")) Log.i(TAG, line);
+              } catch (Throwable ex) {
+                Log.e(TAG, "PROBE_ERROR", ex);
+              }
+              Log.i(TAG, "RESULT_END source=" + source);
+            }
+          }
+          __QUEST_RIPC_FILE_4__
+          mkdir -p 'app/src/main/java/dev/quest/iobt/bodyapiconnectprobe'
+          cat > 'app/src/main/java/dev/quest/iobt/bodyapiconnectprobe/MainActivity.java' <<'__QUEST_RIPC_FILE_5__'
+          package dev.quest.iobt.bodyapiconnectprobe;
+          
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.widget.TextView;
+          
+          public final class MainActivity extends Activity {
+            @Override public void onCreate(Bundle savedState) {
+              super.onCreate(savedState);
+              TextView tv = new TextView(this);
+              tv.setTextSize(17f);
+              tv.setPadding(24, 24, 24, 24);
+              tv.setText("Body API IPC Connection Probe\n\nUse the ADB broadcast to test with VRChat open.\n\nThis screen does not activate IOBT.");
+              setContentView(tv);
+            }
+          }
+          __QUEST_RIPC_FILE_5__
+          mkdir -p 'app/src/main/java/dev/quest/iobt/bodyapiconnectprobe'
+          cat > 'app/src/main/java/dev/quest/iobt/bodyapiconnectprobe/ProbeReceiver.java' <<'__QUEST_RIPC_FILE_6__'
+          package dev.quest.iobt.bodyapiconnectprobe;
+          
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          
+          public final class ProbeReceiver extends BroadcastReceiver {
+            @Override public void onReceive(Context ctx, Intent intent) {
+              String stage = intent.getStringExtra("stage");
+              if (!"connect".equals(stage)) stage = "inspect";
+              final String selected = stage;
+              final PendingResult pending = goAsync();
+              new Thread(() -> {
+                try { ProbeRunner.run(selected, "background-broadcast"); }
+                finally { pending.finish(); }
+              }, "quest-ripc-probe").start();
+            }
+          }
+          __QUEST_RIPC_FILE_6__
+          mkdir -p 'app/src/main/cpp'
+          cat > 'app/src/main/cpp/CMakeLists.txt' <<'__QUEST_RIPC_FILE_7__'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(quest_ripc_connect_probe LANGUAGES CXX)
+          add_library(ripcconnectprobe SHARED ripc_connect_probe.cpp)
+          target_compile_features(ripcconnectprobe PRIVATE cxx_std_17)
+          target_link_libraries(ripcconnectprobe dl log)
+          __QUEST_RIPC_FILE_7__
+          mkdir -p 'app/src/main/cpp'
+          cat > 'app/src/main/cpp/ripc_connect_probe.cpp' <<'__QUEST_RIPC_FILE_8__'
+          #include <jni.h>
+          #include <dlfcn.h>
+          #include <android/log.h>
+          #include <array>
+          #include <cstdint>
+          #include <sstream>
+          #include <string>
+          
+          namespace {
+          constexpr const char* TAG = "QuestBodyRIPC";
+          
+          // Buffer allocated for the IPC platform-context argument. The on-device
+          // ipc_Initialize implementation copies 24 bytes from offset +8. This is
+          // an ABI experiment, NOT a documented Meta SDK type or validated context.
+          struct alignas(8) ExperimentalPlatformContext {
+              std::uint64_t reserved[4] = {0, 0, 0, 0};
+          };
+          static_assert(sizeof(ExperimentalPlatformContext) == 32);
+          
+          std::string dlerr() {
+            const char* e = dlerror();
+            return e ? std::string(e) : std::string("unknown");
+          }
+          
+          template<typename T>
+          T getSymbol(void* lib, const char* name, std::ostringstream& out) {
+            dlerror();
+            void* p = dlsym(lib, name);
+            const char* e = dlerror();
+            out << "SYMBOL " << name << "=" << (p != nullptr && !e ? "FOUND" : "MISSING") << "\n";
+            return e ? nullptr : reinterpret_cast<T>(p);
+          }
+          } // namespace
+          
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_dev_quest_iobt_bodyapiconnectprobe_ProbeRunner_nativeInspect(
+              JNIEnv* env, jclass, jboolean tryConnect) {
+            std::ostringstream out;
+            out << "RIPC_CONNECT_PROBE_VERSION=2\n";
+            out << "MODE=" << (tryConnect ? "CONNECT_EXPERIMENT" : "INSPECT_ONLY") << "\n";
+            out << "CONNECTION_TARGET=com.oculus.bodyapiservice:com.oculus.bodyapiservice (BodyApiServiceServer)\n";
+          
+            dlerror();
+            void* lib = dlopen("libripcclient.oculus.so", RTLD_NOW | RTLD_LOCAL);
+            if (!lib) {
+              out << "LIBRARY_OPEN=FAIL ERROR=" << dlerr() << "\n";
+              return env->NewStringUTF(out.str().c_str());
+            }
+            out << "LIBRARY_OPEN=OK\n";
+          
+            using GetVersion = std::uint32_t (*)();
+            using IsInitialized = bool (*)();
+            using Initialize = std::uint32_t (*)(const void*);
+            using ConnectLegacy = std::uint32_t (*)(const char*, const char*, const char*);
+            // The legacy function appears to accept three strings. Their semantics and
+            // return-code meaning are not documented and remain experimental.
+            auto version = getSymbol<GetVersion>(lib, "ipc_GetRuntimeVersion", out);
+            auto initialized = getSymbol<IsInitialized>(lib, "ipc_IsInitialized", out);
+            auto initialize = getSymbol<Initialize>(lib, "ipc_Initialize", out);
+            auto legacyConnect = getSymbol<ConnectLegacy>(lib, "ipc_ConnectToServer", out);
+            auto extRaw = getSymbol<void*>(lib, "ipc_ConnectToServerExt", out);
+            (void)extRaw; // Never invoked; complex private argument struct.
+          
+            if (version) out << "RUNTIME_VERSION=" << version() << "\n";
+            bool before = initialized && initialized();
+            if (initialized) out << "INITIALIZED_BEFORE=" << (before ? "YES" : "NO") << "\n";
+          
+            if (!tryConnect) {
+              out << "CONNECTION=NOT_ATTEMPTED\n";
+              dlclose(lib);
+              return env->NewStringUTF(out.str().c_str());
+            }
+            if (!initialized || !initialize || !legacyConnect) {
+              out << "CONNECTION=SKIPPED_MISSING_SYMBOL\n";
+              dlclose(lib);
+              return env->NewStringUTF(out.str().c_str());
+            }
+          
+            // Each test runs in its own android:process. A native process crash should
+            // be confined to this APK's test process, not the VRChat process.
+            if (!before) {
+              __android_log_print(ANDROID_LOG_INFO, TAG, "NATIVE_STAGE=BEFORE_EXPERIMENTAL_INITIALIZE");
+              ExperimentalPlatformContext ctx;
+              std::uint32_t initRaw = initialize(&ctx);
+              __android_log_print(ANDROID_LOG_INFO, TAG, "NATIVE_STAGE=AFTER_EXPERIMENTAL_INITIALIZE raw=%u", initRaw);
+              out << "EXPERIMENTAL_INITIALIZE_RAW_RESULT=" << initRaw << "\n";
+            }
+            bool after = initialized();
+            out << "INITIALIZED_AFTER=" << (after ? "YES" : "NO") << "\n";
+            if (!after) {
+              out << "CONNECTION=SKIPPED_INIT_NOT_READY\n";
+              dlclose(lib);
+              return env->NewStringUTF(out.str().c_str());
+            }
+          
+            __android_log_print(ANDROID_LOG_INFO, TAG, "NATIVE_STAGE=BEFORE_CONNECT_TO_BODYAPISERVICESERVER");
+            // Experimental three-string ABI. Based on a previous probe, the strings
+            // appear to represent owner package, process, and server name.
+            // The logs from this run must confirm the resolved target. No data read.
+            std::uint32_t rawResult = legacyConnect("com.oculus.bodyapiservice", "com.oculus.bodyapiservice", "BodyApiServiceServer");
+            __android_log_print(ANDROID_LOG_INFO, TAG, "NATIVE_STAGE=AFTER_CONNECT raw=%u", rawResult);
+            out << "CONNECT_BODYAPISERVICESERVER_RAW_RESULT=" << rawResult << "\n";
+            out << "CONNECT_RESULT_SEMANTICS=UNVERIFIED\n";
+            out << "JOINT_DATA=NOT_REQUESTED\n";
+          
+            // No IPC writes, config updates, or tracking activation. Process lifetime
+            // is managed by the isolated broadcast receiver; leave the connection alone.
+            dlclose(lib);
+            return env->NewStringUTF(out.str().c_str());
+          }
+          __QUEST_RIPC_FILE_8__
+      - name: Build debug APK
+        shell: bash
+        run: gradle --no-daemon :app:assembleDebug
+      - name: Publish APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quest3-BodyApiService-RIPC-Probe-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
