@@ -255,6 +255,41 @@ jobs:
             return env->NewStringUTF(out.str().c_str());
           }
           __IPCPROBE_FILE_8__
+
+      - name: Declare Meta public native libraries
+        run: |
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          path = Path("app/src/main/AndroidManifest.xml")
+          namespace = "http://schemas.android.com/apk/res/android"
+          ET.register_namespace("android", namespace)
+
+          tree = ET.parse(path)
+          application = tree.getroot().find("application")
+
+          if application is None:
+              raise SystemExit("Application element not found")
+
+          libraries = [
+              "libhzos_fphal.meta.so",
+              "libhzos_trackingasset.meta.so",
+              "libhzos_trackingclient.meta.so",
+              "libripcclient.oculus.so",
+              "libripcmanager.oculus.so",
+          ]
+
+          for name in libraries:
+              item = ET.SubElement(application, "uses-native-library")
+              item.set(f"{{{namespace}}}name", name)
+              item.set(f"{{{namespace}}}required", "false")
+
+          tree.write(path, encoding="utf-8", xml_declaration=True)
+          print("Declared Meta native libraries:")
+          print("\n".join(libraries))
+          PY
+
       - name: Build debug APK
         shell: bash
         run: gradle --no-daemon :app:assembleDebug
