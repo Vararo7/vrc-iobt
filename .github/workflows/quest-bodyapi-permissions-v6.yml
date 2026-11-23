@@ -1,0 +1,285 @@
+name: Build Quest 3 Body API Permission Diagnostic v6
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+      - name: Install Android build requirements
+        shell: bash
+        run: |
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.3.13750724" "cmake;3.22.1"
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Generate project source
+        shell: bash
+        run: |
+          mkdir -p 'app'
+          cat > 'app/build.gradle' <<'__QUEST_PERM_V6_16_33884_END__'
+          plugins { id 'com.android.application' }
+          android {
+            namespace 'dev.quest.iobt.bodyapipermv6'
+            compileSdk 35
+            ndkVersion '27.3.13750724'
+            defaultConfig {
+              applicationId 'dev.quest.iobt.bodyapipermv6'
+              minSdk 29
+              targetSdk 34
+              versionCode 6
+              versionName '6.0'
+              ndk { abiFilters 'arm64-v8a' }
+            }
+            externalNativeBuild { cmake { path file('src/main/cpp/CMakeLists.txt'); version '3.22.1' } }
+          }
+          __QUEST_PERM_V6_16_33884_END__
+          mkdir -p 'app/src/main'
+          cat > 'app/src/main/AndroidManifest.xml' <<'__QUEST_PERM_V6_32_74408_END__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="com.oculus.permission.BODY_TRACKING" />
+            <uses-feature android:name="com.oculus.software.body_tracking" android:required="false" />
+            <application android:label="Quest Body API Permission Diagnostic v6" android:allowBackup="false"
+                android:theme="@android:style/Theme.Material.Light.NoActionBar">
+              <uses-native-library android:name="libripcclient.oculus.so" android:required="false" />
+              <uses-native-library android:name="libripcmanager.oculus.so" android:required="false" />
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+              <receiver android:name=".ProbeReceiver" android:exported="true" android:process=":ripc_probe" />
+            </application>
+          </manifest>
+          __QUEST_PERM_V6_32_74408_END__
+          mkdir -p 'app/src/main/cpp'
+          cat > 'app/src/main/cpp/CMakeLists.txt' <<'__QUEST_PERM_V6_31_23838_END__'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(quest_ripc_connect_probe LANGUAGES CXX)
+          add_library(ripcconnectprobe SHARED ripc_connect_probe.cpp)
+          target_compile_features(ripcconnectprobe PRIVATE cxx_std_17)
+          target_link_libraries(ripcconnectprobe dl log)
+          __QUEST_PERM_V6_31_23838_END__
+          mkdir -p 'app/src/main/cpp'
+          cat > 'app/src/main/cpp/ripc_connect_probe.cpp' <<'__QUEST_PERM_V6_39_74093_END__'
+          #include <jni.h>
+          #include <dlfcn.h>
+          #include <android/log.h>
+          #include <array>
+          #include <chrono>
+          #include <cstdint>
+          #include <sstream>
+          #include <string>
+          #include <thread>
+          
+          namespace {
+          constexpr char kTag[] = "QuestBodyPermV6";
+          struct alignas(8) PlatformContext { std::uint64_t reserved[4]{}; };
+          static_assert(sizeof(PlatformContext) == 32);
+          using VersionFn = std::uint32_t (*)();
+          using InitializedFn = bool (*)();
+          using InitFn = std::uint32_t (*)(const void*);
+          using ConnectFn = std::uint32_t (*)(const char*, const char*, const char*);
+          using StateFn = std::uint32_t (*)(std::uint32_t, const char*);
+          using SizeFn = std::uint64_t (*)(std::uint32_t);
+          // Verified in Quest's libripcclient.oculus.so (RuntimeIPC v90):
+          // ripc_internal::GetServerStateGroupPermissions(uint32_t clientId, bool outFlags[8])
+          // Reads exactly 8 flags in RipcClientState::getServerStateGroupPermissions(bool*).
+          using PermissionsFn = bool (*)(std::uint32_t, bool*);
+          // ripc_internal::GetServerStateGroupId(uint32_t stateHandle) returns group ID.
+          using GroupFn = std::uint32_t (*)(std::uint32_t);
+          constexpr const char* kNames[] = {
+              "serviceInfo_", "bodyState_", "bodyStateExtra_", "bodyCodec_",
+              "bodyPoseFullBody_", "bodySkeletonFullBody_", "bodyPose_", "bodySkeleton_"
+          };
+          template<typename T> T symbol(void* lib, const char* name, std::ostringstream& report) {
+              dlerror();
+              void* addr=dlsym(lib,name);
+              bool found=(addr && !dlerror());
+              report << "SYMBOL " << name << "=" << (found ? "FOUND" : "MISSING") << "\n";
+              return found ? reinterpret_cast<T>(addr) : nullptr;
+          }
+          std::string utf(JNIEnv* env, jstring j, const char* fallback) {
+              if(!j) return fallback;
+              const char* p=env->GetStringUTFChars(j,nullptr);
+              if(!p) return fallback;
+              std::string result(p);
+              env->ReleaseStringUTFChars(j,p);
+              return result;
+          }
+          } // namespace
+          
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_dev_quest_iobt_bodyapipermv6_ProbeRunner_nativeRun(JNIEnv* env,jclass,jstring stageArg,jstring contextArg){
+              const std::string stage=utf(env,stageArg,"permissions");
+              const std::string context=utf(env,contextArg,"unspecified");
+              std::ostringstream report;
+              report<<"DIAGNOSTIC_VERSION=5\nCONTEXT_LABEL="<<context<<" (user-supplied, not independently verified)\n"
+                    <<"STAGE="<<stage<<"\nREAD_ONLY_PERMISSIONS=YES\nTRACKING_ACTIVATION_REQUESTED=NO\n"
+                    <<"BODY_BYTES_READ=NO\n";
+              if(stage!="permissions") {
+                  report<<"ABORT=UNSUPPORTED_STAGE\n";
+                  return env->NewStringUTF(report.str().c_str());
+              }
+              void* lib=dlopen("libripcclient.oculus.so",RTLD_NOW|RTLD_LOCAL);
+              if(!lib){report<<"ABORT=LIBRARY_OPEN_FAILED\n";return env->NewStringUTF(report.str().c_str());}
+              const auto ver=symbol<VersionFn>(lib,"ipc_GetRuntimeVersion",report);
+              const auto initialized=symbol<InitializedFn>(lib,"ipc_IsInitialized",report);
+              const auto init=symbol<InitFn>(lib,"ipc_Initialize",report);
+              const auto connect=symbol<ConnectFn>(lib,"ipc_ConnectToServer",report);
+              const auto state=symbol<StateFn>(lib,"ipc_GetServerState",report);
+              const auto size=symbol<SizeFn>(lib,"ipc_GetServerStateMaxSize",report);
+              const auto permissions=symbol<PermissionsFn>(lib,"_ZN13ripc_internal30GetServerStateGroupPermissionsEjPb",report);
+              const auto group=symbol<GroupFn>(lib,"_ZN13ripc_internal21GetServerStateGroupIdEj",report);
+              if(!ver||!initialized||!init||!connect||!state||!size||!permissions||!group||ver()!=90){
+                  report<<"ABORT=UNEXPECTED_RUNTIME_OR_MISSING_SYMBOL\n";
+                  dlclose(lib);return env->NewStringUTF(report.str().c_str());
+              }
+              report<<"RUNTIME_VERSION="<<ver()<<"\n";
+              if(!initialized()){
+                  PlatformContext platform{};
+                  __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=BEFORE_INIT");
+                  report<<"INITIALIZE_RAW="<<init(&platform)<<"\n";
+              }
+              if(!initialized()){
+                  report<<"ABORT=INITIALIZE_FAILED\n";
+                  dlclose(lib);return env->NewStringUTF(report.str().c_str());
+              }
+              __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=BEFORE_CONNECT");
+              std::uint32_t client=connect("com.oculus.bodyapiservice","com.oculus.bodyapiservice","BodyApiServiceServer");
+              __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=AFTER_CONNECT handle=%u",client);
+              report<<"CLIENT_HANDLE="<<client<<"\n";
+              if(!client){report<<"ABORT=CONNECT_NO_HANDLE\n";dlclose(lib);return env->NewStringUTF(report.str().c_str());}
+              for(int round=0;round<2;++round){
+                  if(round) std::this_thread::sleep_for(std::chrono::milliseconds(650));
+                  report<<"ROUND="<<round<<"\n";
+                  std::array<bool,8> flags{};
+                  __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=BEFORE_PERMISSIONS round=%d",round);
+                  const bool ok=permissions(client, flags.data());
+                  __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=AFTER_PERMISSIONS round=%d ok=%d",round,ok);
+                  report<<"GROUP_PERMISSIONS_VALID="<<(ok?"YES":"NO")<<"\n";
+                  if(ok){
+                      for(std::size_t i=0;i<flags.size();++i)
+                          report<<"GROUP "<<i<<" ALLOWED="<<(flags[i]?"YES":"NO")<<"\n";
+                  }
+                  for(const char* name:kNames){
+                      const std::uint32_t id=state(client,name);
+                      if(!id){report<<"STATE "<<name<<" PRESENT=NO\n";continue;}
+                      const std::uint32_t groupId=group(id);
+                      report<<"STATE "<<name<<" PRESENT=YES MAX_BYTES="<<size(id)
+                            <<" GROUP_ID="<<groupId;
+                      if(!ok) report<<" GROUP_ACCESS=UNKNOWN";
+                      else if(groupId<flags.size()) report<<" GROUP_ACCESS="<<(flags[groupId]?"ALLOWED":"DENIED");
+                      else report<<" GROUP_ACCESS=OUT_OF_RANGE";
+                      report<<"\n";
+                  }
+              }
+              report<<"NO_STATE_BUFFER_READS=YES\n";
+              dlclose(lib);
+              return env->NewStringUTF(report.str().c_str());
+          }
+          __QUEST_PERM_V6_39_74093_END__
+          mkdir -p 'app/src/main/java/dev/quest/iobt/bodyapipermv6'
+          cat > 'app/src/main/java/dev/quest/iobt/bodyapipermv6/MainActivity.java' <<'__QUEST_PERM_V6_64_53531_END__'
+          package dev.quest.iobt.bodyapipermv6;
+          
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.widget.TextView;
+          
+          public final class MainActivity extends Activity {
+              @Override public void onCreate(Bundle state){
+                  super.onCreate(state);
+                  TextView view=new TextView(this);
+                  view.setTextSize(17f);
+                  view.setPadding(24,24,24,24);
+                  view.setText("Quest Body API Permission Diagnostic v6\n\nFrom your Mac, send the ADB broadcast while VRChat is running. Read-only permission-group diagnostic. No body pose bytes are accessed or exported.");
+                  setContentView(view);
+              }
+          }
+          __QUEST_PERM_V6_64_53531_END__
+          mkdir -p 'app/src/main/java/dev/quest/iobt/bodyapipermv6'
+          cat > 'app/src/main/java/dev/quest/iobt/bodyapipermv6/ProbeReceiver.java' <<'__QUEST_PERM_V6_65_69632_END__'
+          package dev.quest.iobt.bodyapipermv6;
+          
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          
+          public final class ProbeReceiver extends BroadcastReceiver {
+              @Override public void onReceive(Context ctx, Intent intent) {
+                  final String requestedStage = intent.getStringExtra("stage");
+                  final String stage = "permissions";
+                  final String requestedContext = intent.getStringExtra("context");
+                  final String label = "vrchat".equals(requestedContext) ? "vrchat" :
+                                       "demo".equals(requestedContext) ? "demo" : "unspecified";
+                  final int androidStatus = ctx.checkSelfPermission("com.oculus.permission.BODY_TRACKING");
+                  android.util.Log.i("QuestBodyPermV6", "ANDROID_BODY_TRACKING_PERMISSION=" +
+                      (androidStatus == android.content.pm.PackageManager.PERMISSION_GRANTED ? "GRANTED" : "DENIED"));
+                  final PendingResult pending = goAsync();
+                  new Thread(() -> {
+                      try { ProbeRunner.run(stage,label); }
+                      finally { pending.finish(); }
+                  }, "quest-body-perm-v6").start();
+              }
+          }
+          __QUEST_PERM_V6_65_69632_END__
+          mkdir -p 'app/src/main/java/dev/quest/iobt/bodyapipermv6'
+          cat > 'app/src/main/java/dev/quest/iobt/bodyapipermv6/ProbeRunner.java' <<'__QUEST_PERM_V6_63_53534_END__'
+          package dev.quest.iobt.bodyapipermv6;
+          
+          import android.util.Log;
+          
+          final class ProbeRunner {
+              static final String TAG = "QuestBodyPermV6";
+              static { System.loadLibrary("ripcconnectprobe"); }
+              private static native String nativeRun(String stage, String context);
+          
+              static void run(String stage, String context) {
+                  Log.i(TAG, "RESULT_BEGIN stage="+stage+" context="+context);
+                  try {
+                      String result = nativeRun(stage, context);
+                      for(String line : result.split("\n")) Log.i(TAG,line);
+                  } catch(Throwable t) { Log.e(TAG,"PROBE_ERROR",t); }
+                  Log.i(TAG, "RESULT_END stage="+stage+" context="+context);
+              }
+          }
+          __QUEST_PERM_V6_63_53534_END__
+          mkdir -p '.'
+          cat > 'build.gradle' <<'__QUEST_PERM_V6_12_6066_END__'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          __QUEST_PERM_V6_12_6066_END__
+          mkdir -p '.'
+          cat > 'settings.gradle' <<'__QUEST_PERM_V6_15_26080_END__'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'QuestBodyAPIStateProbe'
+          include ':app'
+          __QUEST_PERM_V6_15_26080_END__
+      - name: Build debug APK
+        shell: bash
+        run: gradle --no-daemon assembleDebug
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quest3-BodyAPI-PermissionDiagnosticV6-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
