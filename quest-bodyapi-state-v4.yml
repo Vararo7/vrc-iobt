@@ -1,0 +1,334 @@
+name: Build Quest 3 Body API State Diagnostic v4
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+      - name: Install Android build requirements
+        shell: bash
+        run: |
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.3.13750724" "cmake;3.22.1"
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Generate project source
+        shell: bash
+        run: |
+          mkdir -p 'app'
+          cat > 'app/build.gradle' <<'__QUEST_BODY_V4_0_END__'
+          plugins { id 'com.android.application' }
+          android {
+            namespace 'dev.quest.iobt.bodyapistatev4'
+            compileSdk 35
+            ndkVersion '27.3.13750724'
+            defaultConfig {
+              applicationId 'dev.quest.iobt.bodyapistatev4'
+              minSdk 29
+              targetSdk 34
+              versionCode 4
+              versionName '4.0'
+              ndk { abiFilters 'arm64-v8a' }
+            }
+            externalNativeBuild { cmake { path file('src/main/cpp/CMakeLists.txt'); version '3.22.1' } }
+          }
+          __QUEST_BODY_V4_0_END__
+          mkdir -p 'app/src/main'
+          cat > 'app/src/main/AndroidManifest.xml' <<'__QUEST_BODY_V4_1_END__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="Quest Body API State Diagnostic v4" android:allowBackup="false"
+                android:theme="@android:style/Theme.Material.Light.NoActionBar">
+              <uses-native-library android:name="libripcclient.oculus.so" android:required="false" />
+              <uses-native-library android:name="libripcmanager.oculus.so" android:required="false" />
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+              <receiver android:name=".ProbeReceiver" android:exported="true" android:process=":ripc_probe" />
+            </application>
+          </manifest>
+          __QUEST_BODY_V4_1_END__
+          mkdir -p 'app/src/main/cpp'
+          cat > 'app/src/main/cpp/CMakeLists.txt' <<'__QUEST_BODY_V4_2_END__'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(quest_ripc_connect_probe LANGUAGES CXX)
+          add_library(ripcconnectprobe SHARED ripc_connect_probe.cpp)
+          target_compile_features(ripcconnectprobe PRIVATE cxx_std_17)
+          target_link_libraries(ripcconnectprobe dl log)
+          __QUEST_BODY_V4_2_END__
+          mkdir -p 'app/src/main/cpp'
+          cat > 'app/src/main/cpp/ripc_connect_probe.cpp' <<'__QUEST_BODY_V4_3_END__'
+          #include <jni.h>
+          #include <dlfcn.h>
+          #include <android/log.h>
+          #include <array>
+          #include <chrono>
+          #include <cstdint>
+          #include <sstream>
+          #include <string>
+          #include <thread>
+          
+          namespace {
+          constexpr char kTag[] = "QuestBodyV4";
+          struct alignas(8) ExperimentalPlatformContext { std::uint64_t reserved[4]{}; };
+          static_assert(sizeof(ExperimentalPlatformContext) == 32);
+          using VersionFn = std::uint32_t (*)();
+          using InitializedFn = bool (*)();
+          using InitFn = std::uint32_t (*)(const void*);
+          using ConnectFn = std::uint32_t (*)(const char*, const char*, const char*);
+          using StateFn = std::uint32_t (*)(std::uint32_t, const char*);
+          using SizeFn = std::uint64_t (*)(std::uint32_t);
+          using GetInterfaceFn = void* (*)(std::uint32_t);
+          using ReleaseInterfaceFn = void (*)(void*);
+          // ARM64 virtual interface ABI, verified against libripcclient.oculus.so v90:
+          // vtable[2] (0x1d7b3c) receives interface, read-index output,
+          // size output, and backing-state output. It includes a callback that
+          // attempts to initialize the shared-memory buffer when unavailable.
+          using InterfaceBeginFn = const void* (*)(void*, std::uint32_t*, std::uint32_t*, const void**);
+          // vtable[3] (0x1d7ccc) expects interface, read index, backing state, changed flag.
+          using InterfaceEndFn = bool (*)(void*, std::uint32_t, const void*, bool*);
+          
+          struct StateInfo { const char* name; std::uint32_t id=0; std::uint64_t maxBytes=0; };
+          constexpr const char* kNames[] = {
+            "serviceInfo_", "bodyState_", "bodyStateExtra_", "bodyCodec_",
+            "bodyPoseFullBody_", "bodySkeletonFullBody_", "bodyPose_", "bodySkeleton_"
+          };
+          template<typename T>
+          T load(void* library, const char* name, std::ostringstream& report) {
+              dlerror();
+              void* address = dlsym(library,name);
+              const char* error = dlerror();
+              const bool found = (!error && address);
+              report << "SYMBOL " << name << "=" << (found?"FOUND":"MISSING") << "\n";
+              return found ? reinterpret_cast<T>(address) : nullptr;
+          }
+          std::string utf(JNIEnv* env, jstring value, const char* defaultText) {
+              if (!value) return defaultText;
+              const char* raw = env->GetStringUTFChars(value,nullptr);
+              if (!raw) return defaultText;
+              std::string result(raw);
+              env->ReleaseStringUTFChars(value,raw);
+              return result;
+          }
+          }  // namespace
+          
+          extern "C" JNIEXPORT jstring JNICALL
+          Java_dev_quest_iobt_bodyapistatev4_ProbeRunner_nativeRun(JNIEnv* env, jclass,
+             jstring stageArg, jstring contextArg) {
+              const std::string stage=utf(env,stageArg,"diagnose");
+              const std::string context=utf(env,contextArg,"unspecified");
+              std::ostringstream report;
+              report << "DIAGNOSTIC_VERSION=4\n"
+                     << "CONTEXT_LABEL=" << context << " (user supplied)\n"
+                     << "STAGE=" << stage << "\n"
+                     << "SERVER=BodyApiServiceServer\n"
+                     << "BUFFER_CONTENT_READ=NO\n"
+                     << "TRACKING_ACTIVATION_REQUESTED=NO\n";
+              if(stage!="diagnose") {
+                  report<<"ABORT=UNSUPPORTED_STAGE\n";
+                  return env->NewStringUTF(report.str().c_str());
+              }
+              void* library=dlopen("libripcclient.oculus.so",RTLD_NOW|RTLD_LOCAL);
+              if(!library) {
+                  report<<"ABORT=RIPC_LIBRARY_UNAVAILABLE\n";
+                  return env->NewStringUTF(report.str().c_str());
+              }
+              const auto version=load<VersionFn>(library,"ipc_GetRuntimeVersion",report);
+              const auto initialized=load<InitializedFn>(library,"ipc_IsInitialized",report);
+              const auto init=load<InitFn>(library,"ipc_Initialize",report);
+              const auto connect=load<ConnectFn>(library,"ipc_ConnectToServer",report);
+              const auto getState=load<StateFn>(library,"ipc_GetServerState",report);
+              const auto getSize=load<SizeFn>(library,"ipc_GetServerStateMaxSize",report);
+              const auto getInterface=load<GetInterfaceFn>(library,"ipc_GetServerStateInterface",report);
+              const auto releaseInterface=load<ReleaseInterfaceFn>(library,"ipc_ReleaseServerStateInterface",report);
+              if(!version||version()!=90 || !initialized||!init||!connect||!getState||!getSize||!getInterface||!releaseInterface) {
+                  report<<"ABORT=UNEXPECTED_RUNTIME_OR_MISSING_SYMBOL\n";
+                  dlclose(library);
+                  return env->NewStringUTF(report.str().c_str());
+              }
+              report<<"RUNTIME_VERSION="<<version()<<"\n";
+              if(!initialized()) {
+                  ExperimentalPlatformContext contextBuffer{};
+                  __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=BEFORE_INIT");
+                  report<<"INITIALIZE_RAW="<<init(&contextBuffer)<<"\n";
+              }
+              if(!initialized()) {
+                  report<<"ABORT=INITIALIZE_FAILED\n";
+                  dlclose(library);
+                  return env->NewStringUTF(report.str().c_str());
+              }
+              __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=BEFORE_CONNECT");
+              const auto client=connect("com.oculus.bodyapiservice","com.oculus.bodyapiservice","BodyApiServiceServer");
+              __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=AFTER_CONNECT client=%u",client);
+              report<<"CLIENT_HANDLE="<<client<<"\n";
+              if(!client) {
+                  report<<"ABORT=CONNECT_NO_HANDLE\n";
+                  dlclose(library);
+                  return env->NewStringUTF(report.str().c_str());
+              }
+          
+              std::array<StateInfo,8> states{};
+              for(std::size_t i=0;i<states.size();++i) states[i].name=kNames[i];
+              for(int round=0;round<2;++round) {
+                  if(round)std::this_thread::sleep_for(std::chrono::milliseconds(650));
+                  report<<"ROUND="<<round<<"\n";
+                  for(auto& state:states) {
+                      state.id=getState(client,state.name);
+                      if(!state.id) {
+                          report<<"STATE "<<state.name<<" PRESENT=NO\n";
+                          continue;
+                      }
+                      state.maxBytes=getSize(state.id);
+                      report<<"STATE "<<state.name<<" PRESENT=YES MAX_BYTES="<<state.maxBytes<<"\n";
+                      __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=BEFORE_INTERFACE state=%s round=%d",state.name,round);
+                      void* iface=getInterface(state.id);
+                      __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=AFTER_INTERFACE state=%s nonNull=%d",state.name,int(iface!=nullptr));
+                      if(!iface) {
+                          report<<"INTERFACE "<<state.name<<" PRESENT=NO\n";
+                          continue;
+                      }
+                      report<<"INTERFACE "<<state.name<<" PRESENT=YES\n";
+                      // The Itanium ABI vtable pointers for this exact firmware were
+                      // confirmed from the actual exported C++ interface implementation.
+                      auto* table=*reinterpret_cast<void***>(iface);
+                      if(!table || !table[2] || !table[3]) {
+                          report<<"BEGIN_INTERFACE "<<state.name<<" ABORT=VTABLE_MISSING\n";
+                          releaseInterface(iface);
+                          continue;
+                      }
+                      auto begin=reinterpret_cast<InterfaceBeginFn>(table[2]);
+                      auto end=reinterpret_cast<InterfaceEndFn>(table[3]);
+                      std::uint32_t readIndex=0xa5a5a5a5u;
+                      std::uint32_t length=0x5a5a5a5au;
+                      const void* backingState=nullptr;
+                      __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=BEFORE_BEGIN_INTERFACE state=%s round=%d",state.name,round);
+                      const void* data=begin(iface,&readIndex,&length,&backingState);
+                      __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=AFTER_BEGIN_INTERFACE state=%s nonNull=%d",state.name,int(data!=nullptr));
+                      report<<"BEGIN_INTERFACE "<<state.name
+                            <<" PTR="<<(data?"NON_NULL":"NULL")
+                            <<" INDEX_SET="<<(readIndex==0xa5a5a5a5u?"NO":"YES")
+                            <<" LENGTH_SET="<<(length==0x5a5a5a5au?"NO":"YES")
+                            <<" BACKING_STATE_SET="<<(backingState?"YES":"NO");
+                      if(length!=0x5a5a5a5au)report<<" LENGTH="<<length;
+                      report<<"\n";
+                      if(data) {
+                          // No dereference! Pair Begin with End and return the buffer.
+                          bool changed=false;
+                          __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=BEFORE_END_INTERFACE state=%s",state.name);
+                          const bool ok=end(iface,readIndex,backingState,&changed);
+                          __android_log_print(ANDROID_LOG_INFO,kTag,"NATIVE_STAGE=AFTER_END_INTERFACE state=%s",state.name);
+                          report<<"END_INTERFACE "<<state.name<<" RESULT="<<(ok?"OK":"FAILED")
+                                <<" CHANGED_FLAG="<<(changed?"YES":"NO")<<"\n";
+                      }
+                      releaseInterface(iface);
+                  }
+              }
+              report<<"RAW_JOINTS_EXPORTED=NO\nFRESHNESS_UNPROVEN=YES\n";
+              dlclose(library);
+              return env->NewStringUTF(report.str().c_str());
+          }
+          __QUEST_BODY_V4_3_END__
+          mkdir -p 'app/src/main/java/dev/quest/iobt/bodyapistatev4'
+          cat > 'app/src/main/java/dev/quest/iobt/bodyapistatev4/MainActivity.java' <<'__QUEST_BODY_V4_4_END__'
+          package dev.quest.iobt.bodyapistatev4;
+          
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.widget.TextView;
+          
+          public final class MainActivity extends Activity {
+              @Override public void onCreate(Bundle state){
+                  super.onCreate(state);
+                  TextView view=new TextView(this);
+                  view.setTextSize(17f);
+                  view.setPadding(24,24,24,24);
+                  view.setText("Quest Body API State Diagnostic v4\n\nRun the ADB broadcast while standalone VRChat or the known working IOBT demo is active. Read-only interface test; no pose bytes logged or tracking changes requested.");
+                  setContentView(view);
+              }
+          }
+          __QUEST_BODY_V4_4_END__
+          mkdir -p 'app/src/main/java/dev/quest/iobt/bodyapistatev4'
+          cat > 'app/src/main/java/dev/quest/iobt/bodyapistatev4/ProbeReceiver.java' <<'__QUEST_BODY_V4_5_END__'
+          package dev.quest.iobt.bodyapistatev4;
+          
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          
+          public final class ProbeReceiver extends BroadcastReceiver {
+              @Override public void onReceive(Context ctx, Intent intent) {
+                  final String requestedStage = intent.getStringExtra("stage");
+                  final String stage = "diagnose";
+                  final String requestedContext = intent.getStringExtra("context");
+                  final String label = "vrchat".equals(requestedContext) ? "vrchat" :
+                                       "demo".equals(requestedContext) ? "demo" : "unspecified";
+                  final PendingResult pending = goAsync();
+                  new Thread(() -> {
+                      try { ProbeRunner.run(stage,label); }
+                      finally { pending.finish(); }
+                  }, "quest-body-v4-probe").start();
+              }
+          }
+          __QUEST_BODY_V4_5_END__
+          mkdir -p 'app/src/main/java/dev/quest/iobt/bodyapistatev4'
+          cat > 'app/src/main/java/dev/quest/iobt/bodyapistatev4/ProbeRunner.java' <<'__QUEST_BODY_V4_6_END__'
+          package dev.quest.iobt.bodyapistatev4;
+          
+          import android.util.Log;
+          
+          final class ProbeRunner {
+              static final String TAG = "QuestBodyV4";
+              static { System.loadLibrary("ripcconnectprobe"); }
+              private static native String nativeRun(String stage, String context);
+          
+              static void run(String stage, String context) {
+                  Log.i(TAG, "RESULT_BEGIN stage="+stage+" context="+context);
+                  try {
+                      String result = nativeRun(stage, context);
+                      for(String line : result.split("\n")) Log.i(TAG,line);
+                  } catch(Throwable t) { Log.e(TAG,"PROBE_ERROR",t); }
+                  Log.i(TAG, "RESULT_END stage="+stage+" context="+context);
+              }
+          }
+          __QUEST_BODY_V4_6_END__
+          mkdir -p '.'
+          cat > 'build.gradle' <<'__QUEST_BODY_V4_7_END__'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          __QUEST_BODY_V4_7_END__
+          mkdir -p '.'
+          cat > 'settings.gradle' <<'__QUEST_BODY_V4_8_END__'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'QuestBodyAPIStateProbe'
+          include ':app'
+          __QUEST_BODY_V4_8_END__
+      - name: Build debug APK
+        shell: bash
+        run: gradle --no-daemon :app:assembleDebug
+      - name: Publish APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Quest3-BodyAPI-StateDiagnosticV4-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
